@@ -52,3 +52,6 @@ node_modules/
 /elf-shell/eb.abc.json
 .DS_Store
 Thumbs.db
+
+# Internal product and development notes
+/docs/
