@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Elf Buddy</title>
+    <style>
+      :root {
+        /* 统一视觉语言 v2：曜石暗底 + 琥珀橙强调（暗色徽章卡片风） */
+        --elf-ink: #f5efe6;
+        --elf-ink-2: rgba(245, 239, 230, 0.66);
+        --elf-ink-3: rgba(245, 239, 230, 0.42);
+        --elf-line: rgba(255, 244, 230, 0.08);
+        --elf-line-strong: rgba(255, 244, 230, 0.17);
+        --elf-accent: #ff9a3d;
+        --elf-accent-strong: #ffb35c;
+        --elf-mint: #5ad8c0;
+        --elf-danger: #ff6b5e;
+        --elf-surface: #211a13;
+        --elf-badge: linear-gradient(135deg, #ffc531, #ff7d1f);
+        --elf-radius: 18px;
+      }
+      html,
+      body,
+      #app {
+        margin: 0;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+      }
+      body {
+        font-family: 'PingFang SC', 'Microsoft YaHei UI', 'Microsoft YaHei', 'Segoe UI',
+          system-ui, sans-serif;
+        color: var(--elf-ink);
+        -webkit-font-smoothing: antialiased;
+      }
+      button,
+      input,
+      textarea {
+        font-family: inherit;
+      }
+      ::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      ::-webkit-scrollbar-thumb {
+        background: rgba(255, 205, 150, 0.18);
+        border-radius: 999px;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background: rgba(255, 205, 150, 0.32);
+      }
+      ::-webkit-scrollbar-track {
+        background: transparent;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
