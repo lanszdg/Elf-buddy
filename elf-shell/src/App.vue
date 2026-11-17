@@ -3,7 +3,7 @@
  * 桌宠渲染（docs/03 §1：四通道动作原语）。
  * 光团小精灵（pet/sprite.ts，渲染层抽象预留 Live2D/VRM）+ 首次引导 + 内容卡片气泡。
  */
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import Onboarding from './components/Onboarding.vue'
 import Settings, { type SettingsData } from './components/Settings.vue'
 import { SpritePetRenderer } from './pet/sprite'
@@ -11,6 +11,12 @@ import { DEFAULT_SPRITE, type PetExpression, type PetMood, type SpriteConfig } f
 import { STATE_CONTRACT, type PetState } from './pet/states'
 import { brainFetch, brainWs, type BrainMood } from './brain'
 import { VoiceClient } from './voice'
+import PetConversation from './components/PetConversation.vue'
+import { interestApi, saveInterest, type Item } from './interest/api'
+import type { InterestTool } from './interest/toolRoutes'
+import { activityState, activityTime, type Activity } from './interest/activity'
+import type { ChatReply } from './brain'
+import { AVATAR_KEY, parseAvatar } from './pet/avatar'
 
 interface SpeakCommand {
   type: 'speak'
@@ -141,6 +147,15 @@ let quipTimer: number | null = null
 let pendingL2: SpeakCommand | null = null
 let pendingL1: SpeakCommand | null = null
 const pet = new SpritePetRenderer()
+const interestNotices = ref<Item[]>([])
+const savingLater = ref(false)
+let noticeTimer = 0
+let activityTimer = 0
+const currentActivity = ref<Activity | null>(null)
+const recentActivity = ref<Activity | null>(null)
+const nowSeconds = ref(Date.now() / 1000)
+const taskDue = computed(() => !!currentActivity.value && currentActivity.value.until <= nowSeconds.value)
+let unlistenAvatar: (() => void) | undefined
 
 // ---- §11.37 状态动作契约：baseMood=brain 长期基准；状态临时 mood 到时回落基准 ----
 let baseMood: PetMood = 'idle'
@@ -180,8 +195,11 @@ const voiceOn = ref(false)
 // ---- 钻地-探头（静默收纳）：无交互时精灵沉到窗口底边之下，鼠标探入底部热区或
 // 新消息到达时冒头。纯渲染层 transform，不动窗口位置（docs/03 §1：壳只做呈现） ----
 const burrowed = ref(false)
-const BURROW_IDLE_MS = 60_000 // 距上次本体交互多久后下沉
-const BURROW_HOTBAND = 40 // 沉底时窗口底部可触发冒头的像素带（对应 .peek 土堆位置）
+const conversationOpen = ref(false)
+let unlistenCompanion: (() => void) | undefined
+const BURROW_IDLE_MS = 60_000
+const BURROW_HOTBAND = 48
+
 let lastPetActivity = Date.now()
 let burrowLoopStarted = false
 
@@ -209,6 +227,8 @@ function startBurrowLoop() {
       !story.value &&
       !settings.value &&
       !pendingL2 &&
+      !conversationOpen.value &&
+      !currentActivity.value &&
       !voiceOn.value &&
       !dragging &&
       Date.now() - lastPetActivity >= BURROW_IDLE_MS
@@ -330,6 +350,7 @@ async function waitBrain(): Promise<Response | null> {
 async function boot() {
   const r = await waitBrain()
   const profile = r ? await r.json().catch(() => ({ exists: false })) : { exists: false }
+  if (r) void restoreActivity()
   if (profile.exists) {
     elfName.value = profile.elf_name || '小芽'
     phase.value = 'pet'
@@ -342,11 +363,14 @@ async function boot() {
 /** 捏脸合并自动装备装饰（§4.1：用户自选装饰优先，永不覆盖捏脸）；§11.37 皮肤从 localStorage 注入。 */
 function mergedConfig(): SpriteConfig {
   const auto = localStorage.getItem('elf_auto_accessory') as SpriteConfig['accessory'] | null
-  const skin = localStorage.getItem('elf_skin')
+  const avatar = parseAvatar(localStorage.getItem(AVATAR_KEY))
+  const skin = avatar ? avatar.drawing : localStorage.getItem('elf_skin')
   return {
     ...spriteCfg,
     accessory: spriteCfg.accessory !== 'none' ? spriteCfg.accessory : (auto ?? 'none'),
     skin: skin ?? undefined,
+    avatar,
+    color: avatar?.color ?? spriteCfg.color,
   }
 }
 
@@ -426,6 +450,7 @@ function closeDigest() {
 // ---- story-1 互动剧：一幕一分支卡片，点选推进，完结自动写回脑侧记忆 ----
 /** 新一幕到达：内容卡片/digest 让位；不自动关（用户自己读，节奏自己掌握）。 */
 function showStory(cmd: StoryCommand) {
+  closeConversation()
   riseUp()
   if (bubble.value) dismiss(true)
   if (digest.value) closeDigest()
@@ -470,6 +495,10 @@ function closeStory() {
 }
 
 function showBubble(cmd: SpeakCommand) {
+  if (conversationOpen.value || dragging || (currentActivity.value && !taskDue.value)) {
+    holdL1(cmd)
+    return
+  }
   riseUp()
   enterState('greet') // §11.37 契约：L3 到达 = 跳+开心脸（开口前先招个呼）
   if (digest.value) closeDigest() // 内容卡片与 digest 互斥（digest 不进反馈学习）
@@ -524,8 +553,11 @@ function attract(cmd: SpeakCommand) {
  */
 let interactive = false
 let dragging = false
+let dragPointer: number | undefined
+let grabPoint = 0
+const GRAB_THRESHOLD = 4
 let lastScreen = { x: 0, y: 0 }
-let dragDist = 0
+let grabbed = false
 // drag-1 投掷测速：拖拽期间 EMA 平滑速度（px/s），松手交给主进程做惯性运动
 let dragVel = { x: 0, y: 0 }
 let lastDragT = 0
@@ -537,29 +569,28 @@ function updateInteractivity(e: MouseEvent) {
     const dy = e.screenY - lastScreen.y
     if (dx || dy) {
       const now = performance.now()
-      const dt = Math.max(1, now - lastDragT)
+      const dt = Math.max(8, now - lastDragT)
+      if (!grabbed) {
+        if (Math.abs(dx) + Math.abs(dy) < GRAB_THRESHOLD) return
+        grabbed = true
+        closeConversation()
+        pet.grab(grabPoint)
+      }
       lastDragT = now
-      // EMA 平滑：瞬时抖动不直接把投掷速度拉飞
-      dragVel.x = 0.6 * dragVel.x + 0.4 * ((dx / dt) * 1000)
-      dragVel.y = 0.6 * dragVel.y + 0.4 * ((dy / dt) * 1000)
-      dragDist += Math.abs(dx) + Math.abs(dy)
+      dragVel.x = 0.45 * dragVel.x + 0.55 * ((dx / dt) * 1000)
+      dragVel.y = 0.45 * dragVel.y + 0.55 * ((dy / dt) * 1000)
       lastScreen = { x: e.screenX, y: e.screenY }
+      pet.dragVelocity(dragVel.x, dragVel.y)
       window.elfShell.dragBy(dx, dy)
-      pet.dragBy?.(dx, dy) // skin-1 拖拽甩动：速度透传给渲染层
     }
     return
   }
   const rect = canvasRef.value?.getBoundingClientRect()
   const lx = e.clientX - (rect?.left ?? 0)
   const ly = e.clientY - (rect?.top ?? 0)
-  // 钻地中：本体已沉，跳过视线跟随与命中判定；底部热区命中即冒头（穿透窗下
-  // mousemove 覆盖整个窗口，用户把鼠标探向右下角 → 精灵噗地冒出来）
   if (burrowed.value) {
-    // 底部热区（.peek 土堆所在横带）：命中即冒头，且让窗口在该带恢复可交互——
-    // 用户能看见土堆、光标变正常、可点击召唤。其余区域保持穿透，不挡下层应用。
-    // 注意必须用 e.clientY（viewport 原点=窗口左上）：canvas 在 .pet 容器内会随
-    // 下沉位移，rect.top 跟着走，ly 凭空少 216px，热区在数学上永远够不到
-    const near = e.clientY >= window.innerHeight - BURROW_HOTBAND
+    const near = e.clientY >= window.innerHeight - BURROW_HOTBAND &&
+      Math.abs(e.clientX - window.innerWidth / 2) <= 66
     if (near) riseUp()
     if (near !== interactive) {
       interactive = near
@@ -569,7 +600,9 @@ function updateInteractivity(e: MouseEvent) {
   }
   if (rect && ly >= 0) pet.lookAt(lx, ly)
   const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null
-  const onBubble = !!el?.closest('.bubble, .voice-line') // 语音控件同享交互区
+  const onBubble = !!el?.closest('.bubble, .voice-line')
+  const onNotice = !!el?.closest('.interest-notice, .activity-chip')
+  const onPet = rect != null && pet.hitTest(lx, ly)
   // dwell 采集：悬停卡片=在读（穿透窗下 mousemove 进出各触发一次，停车阅读全程计入）
   if (bubble.value) {
     if (onBubble && bubbleHoverStart === 0) bubbleHoverStart = Date.now()
@@ -578,7 +611,7 @@ function updateInteractivity(e: MouseEvent) {
       bubbleHoverStart = 0
     }
   }
-  const hit = onBubble || (rect != null && pet.hitTest(lx, ly))
+  const hit = onBubble || onPet || onNotice
   // 注意：悬停不重置静默计时——鼠标常停在右下角本体上，否则钻地永远等不到 60s
   if (hit !== interactive) {
     interactive = hit
@@ -586,23 +619,38 @@ function updateInteractivity(e: MouseEvent) {
   }
 }
 
-function onPetMouseDown(e: MouseEvent) {
+function onPetPointerDown(e: PointerEvent) {
+  if (e.button !== 0 || dragging) return
+  const rect = canvasRef.value?.getBoundingClientRect()
+  if (!rect || !pet.hitTest(e.clientX - rect.left, e.clientY - rect.top)) return
+  const handle = e.currentTarget as HTMLElement
+  handle.setPointerCapture(e.pointerId)
+  dragPointer = e.pointerId
   dragging = true
+  grabPoint = (e.clientX - rect.left - rect.width / 2) / 42
   touchPet()
-  dragDist = 0
+  grabbed = false
   dragVel = { x: 0, y: 0 }
   lastScreen = { x: e.screenX, y: e.screenY }
   lastDragT = performance.now()
-  window.addEventListener('mouseup', onDragEnd, { once: true })
 }
 
-function onDragEnd() {
+function onPetPointerUp(e: PointerEvent, cancelled = false) {
+  if (dragPointer !== e.pointerId) return
+  dragPointer = undefined
   dragging = false
-  // drag-1 快甩松手 → 主进程接管窗口惯性；慢松手走 skin-1 原有弹簧回正
-  const speed = Math.hypot(dragVel.x, dragVel.y)
-  if (speed > 240) {
-    window.elfShell.dragRelease(dragVel.x, dragVel.y)
-    tossGlide(dragVel.x, dragVel.y) // 飞行途中持续甩动（与拖拽共用一套弹簧）
+  if (!grabbed) return
+
+  const pause = Math.max(0, performance.now() - lastDragT - 25)
+  const decay = cancelled ? 0 : Math.exp(-pause / 85)
+  const vx = dragVel.x * decay
+  const vy = dragVel.y * decay
+  pet.releaseGrab(vx, vy)
+  if (Math.hypot(vx, vy) > 240) {
+    window.elfShell.dragRelease(vx, vy)
+    tossGlide(vx, vy)
+  } else {
+    pet.land?.(0.24)
   }
 }
 
@@ -617,7 +665,7 @@ function tossGlide(vx: number, vy: number) {
     vx *= f
     vy *= f
     if (Math.hypot(vx, vy) < 30) return // 与主进程同阈值，落地交给落地挤压
-    pet.dragBy?.((vx * dt) / 1000, (vy * dt) / 1000)
+    pet.dragVelocity(vx, vy)
     requestAnimationFrame(step)
   }
   requestAnimationFrame(step)
@@ -628,7 +676,7 @@ const pokeTimes: number[] = []
 
 function onPetClick(e: MouseEvent) {
   if (e.detail >= 2) return // 双击的第二次 click 交给 openPanel，不重复戳一戳
-  if (dragDist > 6) return // 拖拽落点不触发戳一戳
+  if (grabbed) return // 拖拽落点不触发戳一戳
   if (panel.value) {
     closePanel() // 面板开着时单击精灵=关闭
     return
@@ -639,43 +687,20 @@ function onPetClick(e: MouseEvent) {
   pokeTimes.push(now)
   while (pokeTimes.length && now - pokeTimes[0] > 3_000) pokeTimes.shift()
   pet.setExpression(pokeTimes.length >= 3 ? 'angry' : pickPokeExpr(), 1500)
-  if (pendingL2) {
+  if (currentActivity.value && !bubble.value) {
+    if (conversationOpen.value) closeConversation()
+    else openConversation()
+  } else if (pendingL2) {
+    closeConversation()
     showBubble(pendingL2)
     pendingL2 = null
   } else if (pendingL1) {
+    closeConversation()
     showBubble(pendingL1) // L1 点击展开（docs/05 §2.5）
     pendingL1 = null
   } else if (!bubble.value) {
-    void pokeBrain() // §11.34-A：无内容时戳一戳 → 问脑（有推内容/闲聊），失败本地兜底
-  }
-}
-
-// ---- 戳一戳接脑（docs/05 §11.34-A） ----
-let pokeAskedAt = 0 // 上次问脑时刻：高频连戳（<15s）只给本地俏皮话，不烧 token
-async function pokeBrain() {
-  const now = Date.now()
-  if (now - pokeAskedAt < 15_000) {
-    pet.setExpression('pout', 1500) // §11.35：问太勤，脑不理 → 本地兜底也带情绪
-    showQuip()
-    return
-  }
-  pokeAskedAt = now
-  try {
-    const r = await brainFetch('/poke', { method: 'POST' })
-    if (!r.ok) {
-      showQuip()
-      return
-    }
-    const data = await r.json()
-    if (data.kind === 'chat' && data.reply_text) {
-      showQuip(data.reply_text, 6000) // 脑的接话比本地俏皮话长，给足读完时间
-      const expr = coerceExpr(data.mood)
-      if (expr) pet.setExpression(expr, 2000) // §11.36：被戳的接话 → 脸随语气
-    } else {
-      showQuip() // speak=内容气泡走 WS 下行；noop=脑侧节流中 → 本地兜底
-    }
-  } catch {
-    showQuip() // 脑不在线 → 本地兜底
+    if (conversationOpen.value) closeConversation()
+    else openConversation()
   }
 }
 
@@ -723,7 +748,8 @@ function onLevelUp(level: number) {
 
 /** 双击精灵 → 成长面板（§4.2）；与卡片/digest/俏皮话互斥。 */
 async function openPanel() {
-  if (dragDist > 6) return // 拖拽落点不开面板
+  closeConversation()
+  if (grabbed) return // 拖拽落点不开面板
   if (panel.value) {
     closePanel()
     return
@@ -766,6 +792,7 @@ function openTrend(t: TrendingItem) {
 
 // ---- 设置面板（§5.2：右键精灵唤出；改名字/捏脸/兴趣/清空重来） ----
 async function openSettings() {
+  closeConversation()
   if (settings.value) {
     settings.value = null
     return
@@ -800,6 +827,7 @@ async function openSettings() {
 async function onSettingsSave(data: SettingsData) {
   settings.value = null
   const { skin, ...spriteRest } = data.sprite_config // §11.37 皮肤壳侧持有，不进脑库
+  if ((skin || null) !== localStorage.getItem('elf_skin')) localStorage.removeItem(AVATAR_KEY)
   if (skin) localStorage.setItem('elf_skin', skin)
   else localStorage.removeItem('elf_skin')
   spriteCfg = spriteRest
@@ -863,6 +891,7 @@ function onSettingsQuit() {
 async function onSettingsReset() {
   settings.value = null
   localStorage.removeItem('elf_skin') // §11.37 清空重来 → 皮肤一并回默认光团
+  localStorage.removeItem(AVATAR_KEY)
   try {
     await brainFetch('/reset', { method: 'POST' })
   } catch {
@@ -983,14 +1012,127 @@ function dismiss(opened: boolean) {
   pet.speak(false)
 }
 
+async function pollInterests() {
+  try {
+    const notices = await interestApi<Item[]>('/notices')
+    const hasNewNotice = notices.some(item => !interestNotices.value.some(previous => previous.id === item.id))
+    interestNotices.value = notices
+    if (hasNewNotice) {
+      riseUp()
+      pet.hint()
+    }
+  } catch { /* 大脑启动或重启期间，保留已有提示 */ }
+}
+
+async function saveForLater() {
+  const current = bubble.value
+  if (!current || savingLater.value) return
+  savingLater.value = true
+  try {
+    await saveInterest('handoff', current.payload.title.slice(0, 180), {
+      urls: current.payload.url ? [current.payload.url] : [],
+      texts: [],
+      note: plain(current.payload.summary).slice(0, 400),
+    }, Date.now() / 1000 + 1800)
+    if (bubble.value?.id === current.id) dismiss(true)
+    pet.attract()
+    showQuip('收好了，30 分钟后再继续。')
+  } catch { showQuip('暂时无法保存，请再试一次。') }
+  finally { savingLater.value = false }
+}
+
+function openConversation() {
+  if (phase.value !== 'pet' || settings.value || panel.value) return
+  riseUp()
+  if (bubble.value) dismiss(true)
+  if (digest.value) closeDigest()
+  if (story.value) closeStory()
+  conversationOpen.value = true
+  interactive = true
+  window.elfShell.setInteractive(true)
+}
+
+function closeConversation() {
+  if (!conversationOpen.value) return
+  conversationOpen.value = false
+  exitState('working')
+}
+
+function openInterestTool(section: InterestTool) {
+  closeConversation()
+  window.elfShell.openInterests(section)
+}
+
+function onConversationStatus(waiting: boolean) {
+  if (!conversationOpen.value) return
+  if (waiting) enterState('working')
+  else exitState('working')
+}
+
+function onConversationReply(reply: ChatReply) {
+  const expression = coerceExpr(reply.mood)
+  if (expression) pet.setExpression(expression, 2000)
+}
+
+async function restoreActivity() {
+  try {
+    const state = await activityState()
+    currentActivity.value = state.current
+    recentActivity.value = state.recent
+  } catch { /* the brain may still be starting */ }
+}
+
+function onActivityStarted(activity: Activity) {
+  nowSeconds.value = Date.now() / 1000
+  currentActivity.value = activity
+  pet.hint()
+}
+
+function onActivityFinished(activity: Activity) {
+  currentActivity.value = null
+  if (activity.outcome === 'done') {
+    recentActivity.value = activity
+    enterState('celebrate')
+  }
+  if (activity.outcome === 'later') void pollInterests()
+}
+
+watch(taskDue, due => {
+  if (due) {
+    riseUp()
+    pet.hint()
+  }
+})
+
+function onConversationSaved() {
+  pet.attract()
+  void pollInterests()
+}
+
 onMounted(() => {
   boot()
+  void pollInterests()
+  activityTimer = window.setInterval(() => { nowSeconds.value = Date.now() / 1000 }, 1000)
+  noticeTimer = window.setInterval(pollInterests, 15_000)
+  unlistenAvatar = window.elfShell.onAvatar(value => {
+    if (value && !parseAvatar(value)) return
+    if (value) localStorage.setItem(AVATAR_KEY, value)
+    else localStorage.removeItem(AVATAR_KEY)
+    if (!canvasRef.value) return
+    riseUp()
+    void pet.setModel(JSON.stringify(mergedConfig())).then(() => pet.attract()).catch(() => {})
+  })
   connect()
+  unlistenCompanion = window.elfShell.onCompanionOpen(openConversation)
   window.addEventListener('mousemove', updateInteractivity)
   window.elfShell.onPetImpact((impact) => pet.land?.(impact)) // drag-1 落地/撞边挤压
   if (localStorage.getItem('elf_voice_on') === '1') toggleVoice() // 恢复语音开关（§8.4）
 })
 onUnmounted(() => {
+  clearInterval(noticeTimer)
+  clearInterval(activityTimer)
+  unlistenCompanion?.()
+  unlistenAvatar?.()
   ws?.close()
   voice.stop()
   pet.dispose()
@@ -1112,7 +1254,7 @@ onUnmounted(() => {
       <div class="card-foot">
         <div class="actions">
           <button class="primary" @click="open">看看原文</button>
-          <button class="ghost" @click="dismiss(false)">待会</button>
+          <button class="ghost" :disabled="savingLater" @click="saveForLater">晚点给我</button>
           <button class="vote" title="这类多讲点" @click="feedback(true)">
             <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor"
               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -1198,27 +1340,79 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
+    <PetConversation
+      v-else-if="conversationOpen"
+      :name="elfName"
+      :notice="interestNotices[0]"
+      :activity="currentActivity"
+      :recent-activity="recentActivity"
+      :now="nowSeconds"
+      @activity-started="onActivityStarted"
+      @activity-finished="onActivityFinished"
+      @close="closeConversation"
+      @tool="openInterestTool"
+      @saved="onConversationSaved"
+      @replied="onConversationReply"
+      @waiting="onConversationStatus"
+    />
     <div v-else-if="quip" class="quip">{{ quip }}</div>
     <div v-if="osLine" class="os">{{ osLine }}</div>
     <div v-if="voiceLine" class="voice-line">{{ voiceLine }}</div>
     <div
       class="pet"
       :class="{ burrowed }"
-      @mousedown="onPetMouseDown"
+      @pointerdown="onPetPointerDown"
+      @pointerup="onPetPointerUp"
+      @pointercancel="onPetPointerUp($event, true)"
+      @lostpointercapture="onPetPointerUp($event, true)"
       @click="onPetClick"
       @dblclick="openPanel"
       @contextmenu.prevent="openSettings"
     >
       <canvas ref="canvasRef" class="pet-canvas" />
     </div>
-    <!-- 钻地哨兵：本体沉底后完全隐形，用户找不到召回入口（窗口底边在任务栏上方
-         约 72px，鼠标到屏幕角落在任务栏上触发不到窗口）。沉底时露一个小土堆+眼睛，
-         指示位置；鼠标探入底部热区或点击土堆即冒头 -->
-    <div v-show="burrowed" class="peek"><i /><i /></div>
+    <button v-if="currentActivity && !conversationOpen" type="button" class="activity-chip"
+      :title="currentActivity.idea.title" @click="openConversation">
+      {{ taskDue ? '收尾' : activityTime(currentActivity.until, nowSeconds) }}
+    </button>
+    <button v-if="interestNotices.length && !conversationOpen && !burrowed"
+      class="interest-notice" type="button"
+      :aria-label="'有 ' + interestNotices.length + ' 条待续事项'" title="有待续事项"
+      @click="openConversation"></button>
   </div>
 </template>
 
 <style scoped>
+.activity-chip {
+  position: absolute;
+  bottom: 9px;
+  left: 50%;
+  z-index: 2;
+  transform: translateX(-50%);
+  border: 1px solid #8275a1;
+  border-radius: 10px;
+  padding: 3px 8px;
+  background: #29223c;
+  color: #c1f1dc;
+  font: 650 11px/14px system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.activity-chip:focus-visible { outline: 2px solid #6da993; outline-offset: 2px; }
+.interest-notice {
+  position: absolute;
+  left: calc(50% + 42px);
+  bottom: 101px;
+  width: 15px;
+  height: 15px;
+  z-index: 2;
+  padding: 0;
+  border: 1.5px solid #f8f1df;
+  border-radius: 50%;
+  background: #ad6743;
+  box-shadow: 0 0 0 1px #6f5342;
+  cursor: pointer;
+}
 .stage {
   position: relative;
   width: 100%;
@@ -1231,14 +1425,15 @@ onUnmounted(() => {
   left: 0;
   width: 100%;
   height: 38%;
-  cursor: pointer;
+  cursor: grab;
+  touch-action: none;
   /* 钻地-探头：冒头带回弹，下沉稍缓（躲回去的动作要轻） */
   transition: transform 0.55s cubic-bezier(0.34, 1.45, 0.5, 1);
   will-change: transform;
 }
-/* 沉到窗口底边之下（留 12px 头顶弹性：模型顶边有呆毛/耳尖时会露出小尖尖） */
+.pet:active { cursor: grabbing; }
 .pet.burrowed {
-  transform: translateY(calc(100% - 12px));
+  transform: translateY(91px);
   transition-duration: 0.8s;
   cursor: default;
 }
@@ -1246,42 +1441,9 @@ onUnmounted(() => {
   width: 100%;
   height: 100%;
   display: block;
-  /* 琥珀环境光环（暗色主题）：叠加自身光晕出「头像橙环」效果 */
-  filter: drop-shadow(0 0 22px rgba(255, 150, 50, 0.3));
 }
-/* 钻地哨兵：小土堆+两只眼睛，沉底时指示精灵位置（呼吸微光引鼠标探入热区） */
-.peek {
-  position: absolute;
-  bottom: 1px;
-  left: 50%;
-  transform: translateX(-50%);
-  display: flex;
-  justify-content: center;
-  gap: 9px;
-  width: 56px;
-  height: 16px;
-  padding-top: 5px;
-  border-radius: 14px 14px 4px 4px;
-  background: rgba(34, 30, 26, 0.62);
-  box-shadow: 0 -1px 6px rgba(0, 0, 0, 0.25);
-  pointer-events: none;
-  animation: peek-breathe 2.4s ease-in-out infinite;
-}
-.peek i {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: #ffe9d0;
-  box-shadow: 0 0 6px 1px rgba(255, 175, 90, 0.9);
-}
-@keyframes peek-breathe {
-  0%,
-  100% {
-    opacity: 0.7;
-  }
-  50% {
-    opacity: 1;
-  }
+@media (prefers-reduced-motion: reduce) {
+  .pet.burrowed { transition: none; }
 }
 
 /* ---------- 卡片容器（内容卡/成长面板/晨报/设置共用） ---------- */

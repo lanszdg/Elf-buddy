@@ -8,4 +8,4 @@ numpy>=1.26
 apscheduler>=3.10,<4
 sherpa-onnx>=1.13  # §8.4 语音：KWS 唤醒 + 流式 ASR（纯 wheel，无原生编译）
 pypinyin>=0.55     # §8.4 唤醒词 → KWS 音素生成
-edge-tts>=7.3.1,<8  # 在线神经语音合成，失败时由桌宠回退系统语音
+edge-tts>=7.3.1,<8

@@ -5,12 +5,13 @@
  * 分发形态：生产模式下壳托管大脑——启动时 spawn 打包好的 elf-brain.exe
  * （试用者机器零 Python 依赖），退出时回收子进程。
  */
-import { app, BrowserWindow, ipcMain, net, powerMonitor, protocol, screen } from 'electron'
+import { app, BrowserWindow, globalShortcut, ipcMain, net, powerMonitor, protocol, screen, shell } from 'electron'
 import { spawn, execFile, ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import fs from 'node:fs'
+import { interestTools, isInterestTool, type InterestTool } from '../src/interest/toolRoutes'
 
 // §9.1：brain 全部接口走 /v1 + 一次性 token（本进程生成，拉起 brain 时经环境变量传入；
 // renderer 经 preload 拿到同一 token）。开发模式 brain 由 start.ps1 单独启动，不校验。
@@ -32,6 +33,7 @@ function devLog(msg: string): void {
   }
 }
 let win: BrowserWindow | null = null
+let interestWindow: BrowserWindow | null = null
 let brainProc: ChildProcess | null = null
 let quitting = false
 
@@ -80,7 +82,7 @@ function migrateLegacyData(): void {
   if (moved) console.log(`[migrate] ${moved} 项从 ${legacy} 迁到 ${target}`)
 }
 
-// 自定义协议 elf://model/... 提供 PixiJS 与可选抠图资源（开发=models/，生产=resources/models/）
+// 自定义协议 elf://model/... → Live2D 模型目录（开发=项目 models/，生产=resources/models/）
 // renderer 以 fetch 加载模型；特权注册必须在 app ready 前
 protocol.registerSchemesAsPrivileged([
   { scheme: 'elf', privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true } },
@@ -119,6 +121,44 @@ function startBrain() {
 function stopBrain() {
   brainProc?.kill()
   brainProc = null
+}
+
+function showInterests(section: InterestTool) {
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+  const tool = interestTools[section]
+  const width = Math.min(tool.width, display.workArea.width - 32)
+  const height = Math.min(tool.height, display.workArea.height - 32)
+  const bounds = {
+    width,
+    height,
+    x: Math.round(display.workArea.x + (display.workArea.width - width) / 2),
+    y: Math.round(display.workArea.y + (display.workArea.height - height) / 2),
+  }
+  if (interestWindow && !interestWindow.isDestroyed()) {
+    if (interestWindow.isMinimized()) interestWindow.restore()
+    if (!interestWindow.isMaximized()) interestWindow.setBounds(bounds)
+    interestWindow.show()
+    interestWindow.focus()
+    interestWindow.webContents.send('interest-section', section)
+    return
+  }
+  const active = new BrowserWindow({
+    ...bounds, minWidth: Math.min(500, width), minHeight: Math.min(420, height),
+    title: tool.name + ' · Elf Buddy', backgroundColor: '#f7f4ef', autoHideMenuBar: true,
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), sandbox: true, contextIsolation: true },
+  })
+  interestWindow = active
+  active.once('closed', () => { if (interestWindow === active) interestWindow = null })
+  active.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  active.webContents.on('will-navigate', (event) => event.preventDefault())
+  const query = { view: 'interests', section }
+  if (process.env.VITE_DEV_SERVER_URL) {
+    const url = new URL(process.env.VITE_DEV_SERVER_URL)
+    for (const [key, value] of Object.entries(query)) url.searchParams.set(key, value)
+    void active.loadURL(url.href)
+  } else {
+    void active.loadFile(path.join(__dirname, '../dist/index.html'), { query })
+  }
 }
 
 function createWindow() {
@@ -215,7 +255,7 @@ function startIdleLoop() {
 /**
  * 前台应用采集（docs/01 §M2）：5s 轮询前台窗口进程名 → 泛化类别上行。
  * 零依赖方案：spawn powershell Add-Type 内联 Win32 API（避免 active-win 的 node-gyp 原生编译）。
- * 壳只读取前台进程名，将进程名及归类通过环回接口上报。这里不读取窗口标题。
+ * 隐私红线：进程名在壳侧映射为类别后即丢弃，窗口标题原文不出壳、不取。
  */
 const APP_CLASS: Record<string, string> = {
   code: 'code', cursor: 'code', devenv: 'code', idea64: 'idea',
@@ -287,6 +327,26 @@ app.whenReady().then(() => {
   if (!isDev) migrateLegacyData() // 旧 elf-shell 目录数据一次搬家（开发态由 start.ps1 管数据目录）
   startBrain()
   createWindow()
+  globalShortcut.register('CommandOrControl+Shift+Space', () => {
+    if (!win || win.isDestroyed()) return
+    win.show()
+    win.focus()
+    win.webContents.send('companion-open')
+  })
+  ipcMain.on('interest-open', (event, section: unknown) => {
+    if (event.sender === win?.webContents && isInterestTool(section)) showInterests(section)
+  })
+  ipcMain.handle('interest-external', async (event, value: string) => {
+    if (event.sender !== interestWindow?.webContents && event.sender !== win?.webContents) throw new Error('Invalid window')
+    const url = new URL(value)
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid URL')
+    await shell.openExternal(url.href)
+  })
+  ipcMain.on('interest-avatar', (event, value: string) => {
+    if (event.sender === interestWindow?.webContents && typeof value === 'string' && value.length <= 650000) {
+      win?.webContents.send('interest-avatar-changed', value)
+    }
+  })
   startIdleLoop()
   startForegroundLoop()
   startScreenLockWatch()
@@ -305,21 +365,25 @@ app.whenReady().then(() => {
     devLog('[quit] 主进程收到 elf-quit')
     app.quit()
   })
+  let tossTimer: NodeJS.Timeout | null = null
   // 拖动桌宠：按屏幕坐标增量移动窗口
   ipcMain.on('drag-by', (_e, dx: number, dy: number) => {
     if (!win) return
+    if (tossTimer) {
+      clearInterval(tossTimer)
+      tossTimer = null
+    }
     const [x, y] = win.getPosition()
     win.setPosition(Math.round(x + dx), Math.round(y + dy))
   })
   // drag-1 投掷惯性：renderer 快甩松手把速度（px/s）交过来，主进程 60fps 积分运动——
   // 撞工作区边缘反弹（阻尼 0.55），速度衰减到阈值停住，全程回叫冲击给精灵做落地挤压
-  let tossTimer: NodeJS.Timeout | null = null
   ipcMain.on('drag-release', (_e, vx: number, vy: number) => {
     if (!win) return
     const speed0 = Math.hypot(vx, vy)
     if (speed0 < 240) return // 慢松手就是普通放下， skin-1 弹簧回正已够
     if (tossTimer) clearInterval(tossTimer)
-    const area = screen.getPrimaryDisplay().workArea
+    const area = screen.getDisplayMatching(win.getBounds()).workArea
     const [w, h] = win.getSize()
     let [x, y] = win.getPosition()
     const impactOf = (s: number) => Math.min(0.5, Math.max(0.1, s / 1500))
@@ -397,6 +461,7 @@ app.whenReady().then(() => {
 
 app.on('will-quit', () => {
   quitting = true
+  globalShortcut.unregisterAll()
   stopBrain()
 })
 app.on('window-all-closed', () => app.quit())

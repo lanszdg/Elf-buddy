@@ -32,6 +32,8 @@ from app.core.config import settings
 from app.content.pipeline import ContentPipeline
 from app.growth.account import RelationshipAccount
 from app.growth.persona import PersonaService
+from app.interest import refresh_watches, router as interest_router
+from app.interest_activity import router as activity_router, suggest as suggest_activity
 from app.memory.event_store import EventStore
 from app.memory.fact_extractor import learn_from_utterance
 from app.memory.interest_graph import InterestGraph
@@ -455,6 +457,7 @@ async def lifespan(app: FastAPI):
         CronTrigger(hour=state_machine.quiet_start, minute=25),
         id="evening_echo",
     )
+    scheduler.add_job(refresh_watches, 'interval', minutes=5, id='interest_watches')
     scheduler.start()
     asyncio.create_task(_revisit_refresh())  # 启动即刷新回访候选
     asyncio.create_task(_daily_specials())  # 启动补生成：中午才开机也有当天的特异性内容
@@ -474,6 +477,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="elf-brain", lifespan=lifespan)
+app.include_router(interest_router)
+app.include_router(activity_router)
+
+
+@app.get('/interest/activity/suggest')
+def get_activity_suggestion(minutes: int = 10, intent: str = '', exclude: str = ''):
+    return suggest_activity(graph.snapshot(), max(2, min(minutes, 60)), intent, exclude[:2000].split(','))
 # renderer（localhost/file://）直连 brain 均为跨源；本地单用户服务，全放开
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
@@ -1578,6 +1588,7 @@ async def get_profile() -> dict:
 _RESET_FILES = [
     "event.db", "graph.db", "profile.db", "persona.db", "digest.db", "reminders.db",
     "relationship.json", "interests.json", "sources.json", "profile.json", "coefficients.yaml",
+    "interest.db",
 ]
 _RESET_DIRS = ["reports"]  # Review 报告也是学习数据，一并清空
 

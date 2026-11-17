@@ -19,4 +19,22 @@ contextBridge.exposeInMainWorld('elfShell', {
     ipcRenderer.on('pet-impact', (_e, impact) => cb(impact)),
   /** 退出应用（设置面板「退出」按钮；无边框窗口没有系统关闭按钮） */
   quit: () => ipcRenderer.send('elf-quit'),
+  openInterests: (section: string) => ipcRenderer.send('interest-open', section),
+  onCompanionOpen: (callback: () => void) => {
+    const handler = () => callback()
+    ipcRenderer.on('companion-open', handler)
+    return () => ipcRenderer.removeListener('companion-open', handler)
+  },
+  openInterestLink: (url: string) => ipcRenderer.invoke('interest-external', url) as Promise<void>,
+  applyAvatar: (value: string) => ipcRenderer.send('interest-avatar', value),
+  onAvatar: (callback: (value: string) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, value: string) => callback(value)
+    ipcRenderer.on('interest-avatar-changed', handler)
+    return () => ipcRenderer.removeListener('interest-avatar-changed', handler)
+  },
+  onInterestSection: (callback: (section: string) => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, section: string) => callback(section)
+    ipcRenderer.on('interest-section', handler)
+    return () => ipcRenderer.removeListener('interest-section', handler)
+  },
 })

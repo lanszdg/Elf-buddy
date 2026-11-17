@@ -12,6 +12,12 @@ interface ElfShell {
   /** drag-1 落地/撞边冲击订阅：主进程惯性运动期间回叫（impact 0.1~0.5） */
   onPetImpact(cb: (impact: number) => void): void
   quit(): void
+  openInterests(section: string): void
+  onCompanionOpen(callback: () => void): () => void
+  openInterestLink(url: string): Promise<void>
+  applyAvatar(value: string): void
+  onAvatar(callback: (value: string) => void): () => void
+  onInterestSection(callback: (section: string) => void): () => void
 }
 
 interface Window {

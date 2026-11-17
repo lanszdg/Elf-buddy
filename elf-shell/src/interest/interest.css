@@ -1,0 +1,156 @@
+body:has(.interest-desk) {
+  background: #f7f4ef;
+}
+.interest-desk {
+  --paper: #f7f4ef;
+  --card: #fffdf9;
+  --ink: #2d2b27;
+  --muted: #67635b;
+  --border: #ded8cb;
+  --green: #374834;
+  --accent: #e9efdf;
+  height: 100%;
+  color: var(--ink);
+  background: var(--paper);
+  font-family: "DM Sans", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+  font-size: 14px;
+}
+.interest-desk * { box-sizing: border-box; }
+.interest-desk .desk-main {
+  overflow: auto;
+  height: 100%;
+  padding: 24px clamp(17px, 4vw, 42px) 32px;
+}
+.interest-desk .desk-head { margin-bottom: 23px; }
+.interest-desk h1 { margin: 0; font-size: 24px; line-height: 1.3; }
+.interest-desk h2 { font-size: 17px; margin: 0; }
+.interest-desk h3 { font-size: 14px; margin: 0; overflow-wrap: anywhere; }
+.interest-desk p { margin: 0; line-height: 1.65; overflow-wrap: anywhere; white-space: pre-wrap; }
+.interest-desk small { color: var(--muted); }
+.interest-desk .stack { display: grid; min-width: 0; gap: 15px; align-content: start; }
+.interest-desk .dense { gap: 9px; }
+.interest-desk .two-col, .interest-desk .lab-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 13px;
+}
+.interest-desk .lab-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.interest-desk .card {
+  min-width: 0;
+  padding: 15px;
+  border-radius: 13px;
+  border: 1px solid var(--border);
+  background: var(--card);
+}
+.interest-desk .row, .interest-desk .actions, .interest-desk .controls, .interest-desk .metrics {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+}
+.interest-desk .row { justify-content: space-between; }
+.interest-desk .controls { align-items: flex-end; gap: 12px; }
+.interest-desk .controls label { flex: 1 1 112px; }
+.interest-desk .controls label.grow { flex: 3 1 210px; }
+.interest-desk .row p, .interest-desk .metrics, .interest-desk .muted { color: var(--muted); font-size: 13px; }
+.interest-desk .metrics b { color: var(--ink); }
+.interest-desk label {
+  min-width: 0;
+  display: grid;
+  width: 100%;
+  gap: 6px;
+  color: #48453c;
+  font-size: 13px;
+  font-weight: 600;
+}
+.interest-desk label.check {
+  width: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 500;
+}
+.interest-desk label.check small { display: block; margin-top: 4px; }
+.interest-desk input, .interest-desk textarea, .interest-desk select {
+  padding: 8px 10px;
+  min-width: 0;
+  width: 100%;
+  color: var(--ink);
+  background: #fffefb;
+  border: 1px solid #d6d0c2;
+  border-radius: 8px;
+  accent-color: var(--green);
+  font: inherit;
+  font-weight: 400;
+}
+.interest-desk textarea { resize: vertical; }
+.interest-desk input[type="color"] { width: 80px; height: 36px; padding: 3px; }
+.interest-desk input[type="range"] { background: transparent; border: none; padding: 0; }
+.interest-desk input[type="checkbox"] { flex: 0 0 auto; width: 15px; height: 15px; }
+.interest-desk button {
+  min-height: 35px;
+  max-width: 100%;
+  padding: 7px 11px;
+  border: 1px solid #d6d0c2;
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.interest-desk button:hover { background: #eeeee3; }
+.interest-desk button:disabled { opacity: 0.5; cursor: default; }
+.interest-desk button.primary { color: #fffdf8; background: var(--green); border-color: var(--green); }
+.interest-desk button.primary:hover { background: #455941; }
+.interest-desk button.text-button { padding-inline: 7px; background: transparent; border-color: transparent; color: #774c45; }
+.interest-desk :focus-visible { outline: 2px solid #687e52; outline-offset: 2px; }
+.interest-desk .hint, .interest-desk .error { padding: 9px 12px; border-radius: 8px; }
+.interest-desk .hint { background: var(--accent); color: #30412a; }
+.interest-desk .error { background: #f4e3dd; color: #752f26; }
+.interest-desk .desk-main > .hint, .interest-desk .desk-main > .error { margin-bottom: 15px; }
+.interest-desk blockquote {
+  margin: 0;
+  padding: 5px 10px;
+  border-left: 2px solid #9aa885;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+.interest-desk .lab-card { display: grid; gap: 9px; }
+.interest-desk .lab-card.chosen { border-color: #748461; }
+.interest-desk .swing-pad {
+  width: 100%; height: 115px; touch-action: none; user-select: none;
+  display: grid; place-items: center;
+  background: #f4f0e8; border: none; cursor: grab;
+}
+.interest-desk .swing-pad:active { cursor: grabbing; }
+.interest-desk .swing-pet {
+  width: 48px; height: 43px;
+  position: relative; transform-origin: center 105%;
+  border-radius: 48% 50% 44% 42%;
+  background: var(--pet-tint);
+  box-shadow: inset 0 6px 10px #ffffff35, 0 6px 12px #352e2429;
+}
+.interest-desk .swing-pet::before, .interest-desk .swing-pet::after {
+  content: ""; position: absolute; top: -8px; width: 12px; height: 17px;
+  background: var(--pet-tint); border-radius: 80% 65% 25% 30%;
+}
+.interest-desk .swing-pet::before { left: 5px; transform: rotate(-17deg); }
+.interest-desk .swing-pet::after { right: 5px; transform: rotate(17deg); }
+.interest-desk .swing-pet i {
+  position: absolute; top: 17px; left: 15px; width: 4px; height: 5px; border-radius: 50%;
+  background: #211c19; box-shadow: 14px 0 #211c19;
+}
+.interest-desk .photo-frame { position: relative; background: #e0dbcf; touch-action: none; user-select: none; cursor: crosshair; border-radius: 6px; overflow: hidden; }
+.interest-desk .photo-frame img { display: block; width: 100%; height: auto; }
+.interest-desk .photo-region { position: absolute; pointer-events: none; border: 2px solid #f8ffe9; box-shadow: 0 0 0 1px #344632; background: #d3f7a81c; }
+.interest-desk .histogram { height: 65px; display: grid; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 2px; background: #eeeae1; padding: 4px; border-radius: 5px; }
+.interest-desk .histogram i { background: #667751; border-radius: 2px 2px 0 0; }
+.interest-desk .avatar-preview { height: 300px; overflow: hidden; border-radius: 9px; background: radial-gradient(ellipse at 50% 85%, #eee2d3, #f4efe5 70%); cursor: grab; touch-action: none; }
+.interest-desk .avatar-preview:active { cursor: grabbing; }
+.interest-desk .avatar-preview canvas { display: block; }
+@media (max-width: 750px) {
+  .interest-desk .lab-grid, .interest-desk .avatar-layout { grid-template-columns: 1fr; }
+}

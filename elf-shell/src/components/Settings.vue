@@ -260,7 +260,7 @@ function submitCorrection() {
       <button v-if="!confirmReset" class="ghost danger" @click="confirmReset = true">
         清空重来…
       </button>
-      <button v-else class="danger" @click="emit('reset')">确认抹掉全部数据</button>
+      <button v-else class="danger" @click="emit('reset')">确认清空精灵档案与记忆</button>
     </div>
   </div>
 </template>

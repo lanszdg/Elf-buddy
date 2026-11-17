@@ -44,6 +44,11 @@ try {
     if ($r.StatusCode -eq 200) { $brainUp = $true }
 } catch {}
 if ($brainUp) {
+    try {
+        Invoke-WebRequest -Uri 'http://127.0.0.1:8787/v1/interest/activity/current' -Headers $headers -TimeoutSec 2 -UseBasicParsing | Out-Null
+    } catch {
+        throw '8787 端口运行的是旧版后端。请关闭之前的后端窗口，再重新运行 start.ps1。'
+    }
     Write-Host 'brain 已在运行，跳过' -ForegroundColor Yellow
 } else {
     Start-Process powershell -ArgumentList @(

@@ -2,13 +2,17 @@
  * 光团小精灵渲染实现（docs/05 §1：程序生成，零外部模型，捏脸=改参数）。
  *
  * 只需 pixi.min.js（UMD 版，同 live2d 方案的加载原因）。
- * 本体=径向渐变发光体；五官/装饰全部 Graphics 手绘；
+ * 不透明外套使用本地 Canvas 纹理，五官、装饰与肢体留在可调关节上。
  * 动画（呼吸/眨眼/跳跃/口型/睡眠）由 ticker 状态机驱动。
  * 内部坐标系按 R=50 固定单位绘制，布局时整体缩放——resize 无需重建几何。
  */
 import type { PetExpression, PetMood, PetRenderer } from './renderer'
 import { DEFAULT_SPRITE, type SpriteConfig } from './renderer'
 import { cutoutSkin, segmentLimbs, type SkinLimb } from './skinCutout'
+import { DEFAULT_DAMPING, DEFAULT_STIFFNESS, stepSpring } from './spring'
+import { DragPose, type PartKind } from './dragPose'
+import { ROUND_AVATAR, type Avatar } from './avatar'
+import { BODY_HEIGHT, BODY_ORIGIN_Y, BODY_WIDTH, FACE_EYE_Y, drawCompanionCoat, mixColor } from './companionArt'
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 declare global {
@@ -32,8 +36,10 @@ function loadPixi(): Promise<any> {
 }
 
 const R = 50 // 内部单位半径
-const GLOW_D = R * 4.6 // 外层光晕直径（≈230），视觉外沿的真实边界
-const DARK = 0x2b2b3a
+const FIGURE_BOX = 200
+const FOOT_PADDING = 30
+const EYE_GAP = 13
+const DARK = 0x242b39
 const SIZE_FACTOR: Record<SpriteConfig['size'], number> = { s: 0.85, m: 1, l: 1.15 }
 /** skin-3 嘴线位置（图高比例）：胸像/正比大头的嘴基本都在中线附近，以下半幅下拉模拟开口。 */
 const SKIN_JAW_FRAC = 0.5
@@ -100,12 +106,13 @@ export class SpritePetRenderer implements PetRenderer {
   private accessory: any = null
   private cfg: SpriteConfig = DEFAULT_SPRITE
   private radialTexture: any = null
+  private coatTexture: any = null
   private growth = 1 // 成长缩放（§4.1 升级变大；setModel 重建后仍生效）
   private skinTex: any = null // §11.37 用户上传皮肤的 PIXI 纹理（加载失败回落光团）
   private skinTexUrl: string | null = null // 抠图后的 dataURL（skin-2 肢体切分输入）
   private skinSprite: any = null // 皮肤精灵（命中检测要量它的实际显示尺寸）
   // skin-2 四肢子精灵：angle/vel=弹簧摆动状态，side=-1 左/+1 右，phase=待机相位错开
-  private limbs: Array<{ sp: any; kind: 'arm' | 'leg'; side: number; angle: number; vel: number; phase: number }> = []
+  private limbs: Array<{ sp: any; kind: PartKind; side: number; angle: number; vel: number; phase: number }> = []
   private skinJaw: any = null // skin-3 嘴线以下半幅精灵：speaking 时下拉产生开口
   private skinJawRestY = 0 // skinJaw 贴嘴线的静止 y（speak(false) 复位用）
 
@@ -133,20 +140,18 @@ export class SpritePetRenderer implements PetRenderer {
   private idleAct: 'stretch' | 'look' | 'nod' | 'sway' = 'stretch' // §11.35 随机小动作
   private idleActStart = -1
   private idleAt = 0 // 下次小动作候选时刻
-  // skin-1 拖拽甩动：速度→倾角/拉伸目标值，松手后弹簧回正
-  private dragTarget = 0
-  private dragRot = 0
-  private dragStretch = 0
-  private lastDragAt = 0
+  private readonly dragPose = new DragPose()
   // drag-1 落地挤压：投掷落地/撞边时的衰减振荡形变（landT<0 空闲，0~1 播放中）
   private landT = -1
   private landImpact = 0
+  private walkStart = -1
 
   async init(canvas: HTMLCanvasElement): Promise<void> {
     this.PIXI = await loadPixi()
     this.app = new this.PIXI.Application({
       view: canvas,
       transparent: true,
+      antialias: true,
       autoDensity: true,
       resolution: window.devicePixelRatio || 1,
       resizeTo: canvas.parentElement ?? window,
@@ -168,6 +173,8 @@ export class SpritePetRenderer implements PetRenderer {
       this.app.stage.removeChild(this.root)
       this.root.destroy({ children: true })
     }
+    this.coatTexture?.destroy(true)
+    this.coatTexture = null
     await this.build()
     this.layout()
     this.touch()
@@ -181,7 +188,7 @@ export class SpritePetRenderer implements PetRenderer {
     const h = this.app.renderer.height / this.app.renderer.resolution
     // 视线相对精灵中心的归一化偏移
     this.look.x = Math.max(-1, Math.min(1, (x - this.root.x) / (w * 0.35)))
-    this.look.y = Math.max(-1, Math.min(1, (y - (this.root.y - 62 * this.root.scale.y)) / (h * 0.35)))
+    this.look.y = Math.max(-1, Math.min(1, (y - (this.root.y + FACE_EYE_Y * this.root.scale.y)) / (h * 0.35)))
     this.touch()
   }
 
@@ -197,12 +204,14 @@ export class SpritePetRenderer implements PetRenderer {
       return Math.abs(dx) <= hw + 6 && dy <= 6 && dy >= -hh - 6
     }
     const s = this.root.scale.x
-    const cx = this.root.x
-    const cy = this.root.y + (this.body.y - R) * s // 身体中心（部件围绕 (0,-R) 绘制，含跳跃偏移）
-    const dx = x - cx
-    const dy = y - cy
-    const r = 60 * s // 略大于本体、小于光晕，光晕外沿不挡下层点击
-    return dx * dx + dy * dy <= r * r
+    const avatar = this.cfg.avatar
+    const scaleX = s * this.body.scale.x
+    const scaleY = s * this.body.scale.y
+    const dx = (x - this.root.x - this.body.x * s) / scaleX
+    const dy = (y - this.root.y - this.body.y * s) / scaleY
+    if ((dx / 49) ** 2 + ((dy + 46) / 46) ** 2 <= 1) return true
+    const earHeight = 39 * (avatar?.ears ?? 0.69)
+    return earHeight > 4 && dy < -71 && dy >= -75 - earHeight && Math.abs(Math.abs(dx) - 26) < 13
   }
 
   attract(): void {
@@ -233,16 +242,30 @@ export class SpritePetRenderer implements PetRenderer {
     if (this.speaking) this.touch()
   }
 
+  walk(): void {
+    this.touch()
+    this.walkStart = performance.now()
+  }
+
   poke(): void {
     this.touch()
     this.pokeStart = performance.now()
   }
 
-  /** skin-1 拖拽甩动：App.vue 拖拽中每帧传入窗口位移（px）。 */
-  dragBy(dx: number, dy: number): void {
-    this.lastDragAt = performance.now()
-    this.dragTarget = Math.max(-0.5, Math.min(0.5, dx * 0.028))
-    this.dragStretch = Math.max(0, Math.min(0.28, Math.hypot(dx, dy) * 0.014))
+  grab(point: number): void {
+    this.dragPose.start(point)
+    this.idleActStart = -1
+    this.hopStart = -1
+    this.landT = -1
+    this.touch()
+  }
+
+  dragVelocity(vx: number, vy: number): void {
+    this.dragPose.move(vx, vy)
+  }
+
+  releaseGrab(vx = 0, vy = 0): void {
+    this.dragPose.release(vx, vy)
     this.touch()
   }
 
@@ -250,9 +273,9 @@ export class SpritePetRenderer implements PetRenderer {
   land(impact: number): void {
     this.landImpact = Math.max(0.1, Math.min(0.5, impact))
     this.landT = 0
-    // skin-2：四肢随机方向踢一脚，力度随 impact（撞墙/落地都触发 → 连撞连踢）
     for (const lb of this.limbs) {
-      lb.vel += (Math.random() - 0.35) * this.landImpact * 6 * (lb.kind === 'arm' ? 1 : 0.55)
+      const direction = lb.kind === 'arm' ? -lb.side : lb.side
+      lb.vel += direction * this.landImpact * (lb.kind === 'ear' ? 20 : 13)
     }
     this.touch()
   }
@@ -276,6 +299,8 @@ export class SpritePetRenderer implements PetRenderer {
 
   dispose(): void {
     this.app?.ticker.remove(this.tick)
+    this.coatTexture?.destroy(true)
+    this.coatTexture = null
     window.removeEventListener('resize', this.layout)
     this.app?.destroy(true)
     this.app = null
@@ -332,7 +357,7 @@ export class SpritePetRenderer implements PetRenderer {
 
   private async build(): Promise<void> {
     const P = this.PIXI
-    const color = parseInt(this.cfg.color.slice(1), 16)
+    const color = /^#[a-f\d]{6}$/i.test(this.cfg.color) ? parseInt(this.cfg.color.slice(1), 16) : 0x7ec8ff
     this.eyes = []
     this.pupils = []
     this.skinSprite = null
@@ -355,30 +380,37 @@ export class SpritePetRenderer implements PetRenderer {
     if (this.cfg.accessory === 'wings') {
       for (const side of [-1, 1]) {
         const w = new P.Graphics()
-        w.beginFill(0xffffff, 0.55)
-        w.drawEllipse(0, 0, 24, 13)
-        w.endFill()
-        w.x = side * 52
-        w.y = -12
+        w.lineStyle(1.5, 0x515364).beginFill(0xf6e9cd)
+        w.drawEllipse(0, 0, 17, 9).endFill()
+        w.x = side * 43
+        w.y = -30
         w.rotation = side * -0.55
         w.name = `wing${side}`
         this.body.addChild(w)
       }
     }
 
-    // 外发光 + 本体 + 高光
-    this.glow = this.makeGlowSprite(color, R * 4.6, 0.32)
-    this.glow.y = -R
-    this.body.addChild(this.glow)
+    this.addGroundShadow()
+    const avatar = this.cfg.avatar ?? { ...ROUND_AVATAR, ears: 0.69, tail: 0.36 }
+    this.buildAvatarParts(color, avatar)
 
-    const core = this.makeGlowSprite(color, R * 2.05, 1, false)
-    core.y = -R
-    this.body.addChild(core)
+    this.coatTexture = P.Texture.from(drawCompanionCoat(color))
+    const coat = new P.Sprite(this.coatTexture)
+    coat.anchor.set(0.5, 0)
+    coat.y = BODY_ORIGIN_Y
+    coat.width = BODY_WIDTH
+    coat.height = BODY_HEIGHT
+    this.body.addChild(coat)
+    for (const limb of this.limbs) {
+      if (limb.kind === 'arm') this.body.addChild(limb.sp)
+    }
 
-    const hl = this.makeGlowSprite(0xffffff, R * 0.9, 0.4)
-    hl.x = -R * 0.32
-    hl.y = -R * 1.35
-    this.body.addChild(hl)
+    const clasp = new P.Graphics()
+    clasp.lineStyle(1.2, 0x745446).beginFill(0xe9b980)
+      .moveTo(1, -19).quadraticCurveTo(10, -19, 12, -12)
+      .quadraticCurveTo(5, -10, 1, -19).endFill()
+    clasp.lineStyle(1, 0x865744).moveTo(1, -19).lineTo(8, -14.5)
+    this.body.addChild(clasp)
 
     // 呆毛（本体之上、五官之下）
     if (this.cfg.accessory === 'antenna') {
@@ -394,7 +426,7 @@ export class SpritePetRenderer implements PetRenderer {
       this.body.addChild(a)
     }
 
-    this.buildFace(color)
+    this.buildFace()
 
     // 光环（最上层，浮在头顶）
     if (this.cfg.accessory === 'halo') {
@@ -426,11 +458,7 @@ export class SpritePetRenderer implements PetRenderer {
     this.mouth = null
     this.sticker = null
     this.accessory = null
-    // 脚下柔光垫（兼任 this.glow：hint/poke/speak 的光脉冲都落在它上面）
-    const pad = this.makeGlowSprite(0xffc38f, R * 2.2, 0.22)
-    pad.y = -4
-    this.body.addChild(pad)
-    this.glow = pad
+    this.addGroundShadow()
     const sp = new P.Sprite(this.skinTex)
     sp.anchor.set(0.5, 1) // 底部中心=root 原点（站立点），与光团本体的贴地逻辑一致
     const boxH = R * 3.4 // 与光团"核心+头顶"相当的高度预算
@@ -475,16 +503,63 @@ export class SpritePetRenderer implements PetRenderer {
     }
   }
 
-  /** skin-2：把切出的肢体挂到 body 上。枢轴像素 → body 本地坐标（与底图同一仿射），
-   * anchor=枢轴在子图内的归一位置 → rotation 即绕肩/髋挥舞；底图完整印刷回盖旋转缝。 */
+  private addGroundShadow() {
+    this.glow = this.makeGlowSprite(0x232830, 114, 0.16, false)
+    this.glow.height = 21
+    this.glow.y = 0
+    this.root.addChildAt(this.glow, 0)
+  }
+
+  private buildAvatarParts(color: number, avatar: Avatar) {
+    const add = (kind: PartKind, side: number, x: number, y: number, length: number, thickness: number) => {
+      if (length <= 0) return
+      const part = new this.PIXI.Graphics()
+      const ear = kind === 'ear'
+      const edge = mixColor(color, 0x283047, 0.73)
+      if (ear) {
+        const half = thickness / 2
+        part.lineStyle(1.7, edge).beginFill(mixColor(color, 0xf8ebd9, 0.32))
+          .moveTo(-half * 0.65, 1)
+          .bezierCurveTo(-half * 1.05, -length * 0.58, -5, -length * 0.93, 2, -length)
+          .bezierCurveTo(half * 1.25, -length * 0.78, half * 1.35, -length * 0.35, half * 0.72, 1)
+          .closePath().endFill()
+        if (length > 12) {
+          part.lineStyle(0).beginFill(mixColor(0xd88b8c, color, 0.22))
+            .drawEllipse(1.7, -length * 0.45, thickness * 0.23, length * 0.29).endFill()
+        }
+      } else {
+        part.lineStyle(1.5, edge).beginFill(mixColor(color, 0x515477, kind === 'tail' ? 0.31 : 0.22))
+          .drawRoundedRect(-thickness / 2, -thickness / 3, thickness, length + thickness / 3, thickness / 2).endFill()
+        part.lineStyle(0).beginFill(0xffe6cf, 0.33)
+          .drawEllipse(-1, length * 0.72, thickness * 0.28, thickness * 0.2).endFill()
+      }
+      part.position.set(x, y)
+      part.rotation = side * (ear ? 0.21 : kind === 'tail' ? -1.08 : kind === 'arm' ? -0.37 : -0.12)
+      this.body.addChild(part)
+      this.limbs.push({ sp: part, kind, side, angle: part.rotation, vel: 0, phase: side === 1 ? Math.PI : 0 })
+    }
+    for (const side of [-1, 1]) {
+      const earLength = avatar.kind === 'long-ears' ? 41 : 29
+      add('ear', side, side * 23, -73, earLength * avatar.ears * (side === -1 ? 0.9 : 1), 16)
+      add('arm', side, side * 37, -32, 24 * avatar.arms, 12)
+      add('leg', side, side * 17, -13, 26 * avatar.legs, 16)
+    }
+    add('tail', 1, 32, -23, 29 * avatar.tail, 12)
+  }
+
+  /** Attach an imported image limb at the shoulder or hip pivot. */
   private attachLimb(seg: SkinLimb, k: number, imgW: number, imgH: number): void {
     const P = this.PIXI
     const lb = new P.Sprite(P.Texture.from(seg.canvas))
+    const avatar = this.cfg.avatar
+    const correction = seg.kind.startsWith('arm') ? avatar?.shoulder : avatar?.hip
+    const pivotY = Math.max(seg.oy, Math.min(seg.oy + seg.canvas.height,
+      seg.pivotY + (correction ?? 0) * imgH))
     lb.anchor.set(
       Math.min(1, Math.max(0, (seg.pivotX - seg.ox) / seg.canvas.width)),
-      Math.min(1, Math.max(0, (seg.pivotY - seg.oy) / seg.canvas.height))
+      Math.min(1, Math.max(0, (pivotY - seg.oy) / seg.canvas.height))
     )
-    lb.position.set((seg.pivotX - imgW * 0.5) * k, (seg.pivotY - imgH) * k)
+    lb.position.set((seg.pivotX - imgW * 0.5) * k, (pivotY - imgH) * k)
     lb.scale.set(k)
     this.body.addChild(lb) // 后加 = 画在躯干底图之上
     this.limbs.push({
@@ -497,18 +572,20 @@ export class SpritePetRenderer implements PetRenderer {
     })
   }
 
-  private buildFace(color: number): void {
+  private buildFace(): void {
     const P = this.PIXI
-    const eyeY = -R - 12
+    const eyeY = FACE_EYE_Y
+    const eyeSpread = this.cfg.avatar?.eyes ?? 1
     for (const side of [-1, 1]) {
       const box = new P.Container()
-      box.x = side * 17
+      box.x = side * EYE_GAP * eyeSpread
       box.y = eyeY
       const g = new P.Graphics()
       if (this.cfg.eyes === 'round') {
         const pupil = new P.Graphics()
-        pupil.beginFill(DARK).drawCircle(0, 0, 6.5).endFill()
-        pupil.beginFill(0xffffff).drawCircle(2.2, -2.2, 2).endFill()
+        pupil.beginFill(DARK).drawEllipse(0, 1, 4.8, 6.2).endFill()
+        pupil.beginFill(0xfffcf4).drawCircle(-1.3, -1.1, 1.55).endFill()
+        pupil.beginFill(0xeebaa1, 0.55).drawCircle(1.3, 3.1, 0.64).endFill()
         g.addChild(pupil)
         this.pupils.push(pupil)
       } else if (this.cfg.eyes === 'happy') {
@@ -532,23 +609,24 @@ export class SpritePetRenderer implements PetRenderer {
       this.eyes.push(box)
     }
     this.mouth = new P.Graphics()
-    this.mouth.y = -R + 8
+    this.mouth.y = -34
     this.body.addChild(this.mouth)
 
     // §11.35 表情部件：眉毛（默认清空隐藏）/腮红/情绪符号贴纸
     this.brows = []
     for (const side of [-1, 1]) {
       const b = new P.Graphics()
-      b.x = side * 17
-      b.y = -R - 28
+      b.x = side * EYE_GAP * eyeSpread
+      b.y = FACE_EYE_Y - 14
       this.body.addChild(b)
       this.brows.push(b)
     }
     this.blushes = []
     for (const side of [-1, 1]) {
-      const bl = this.makeGlowSprite(0xff8fa8, 24, 0, false)
-      bl.x = side * 25
-      bl.y = -R + 2
+      const bl = this.makeGlowSprite(0xd96c79, 14, 0, false)
+      bl.height = 8
+      bl.x = side * 23
+      bl.y = -38
       this.body.addChild(bl)
       this.blushes.push(bl)
     }
@@ -600,8 +678,8 @@ export class SpritePetRenderer implements PetRenderer {
       m.arc(0, -2, 5, Math.PI * 0.2, Math.PI * 0.8)
     } else {
       // 闭合微笑（默认）
-      m.lineStyle(3, DARK, 1)
-      m.arc(0, -3, 8, Math.PI * 0.18, Math.PI * 0.82)
+      m.lineStyle({ width: 2.1, color: DARK, cap: this.PIXI.LINE_CAP.ROUND })
+      m.moveTo(-5, -2).quadraticCurveTo(0, 4, 5, -2)
     }
   }
 
@@ -732,10 +810,8 @@ export class SpritePetRenderer implements PetRenderer {
     const t = now / 1000
     const mp = MOOD_PARAMS[this.mood]
 
-    // 睡眠：120s 无交互 → 变暗慢呼吸
+    // Keep the coat opaque, including when the character dozes off.
     const sleeping = now - this.lastInteract > 120_000
-    const targetAlpha = sleeping ? 0.55 : 1
-    this.root.alpha += (targetAlpha - this.root.alpha) * 0.02
     const period = sleeping ? 6 : mp.breathPeriod
 
     // 呼吸（果冻感：X/Y 反相 + 轻微浮沉，幅度要肉眼可见；§8.3 情绪倍率）
@@ -778,6 +854,7 @@ export class SpritePetRenderer implements PetRenderer {
     let actGlow = 0
     if (
       this.idleActStart < 0 &&
+      !this.dragPose.held &&
       !this.speaking &&
       now - this.lastInteract > 25_000 &&
       now > this.idleAt
@@ -792,31 +869,32 @@ export class SpritePetRenderer implements PetRenderer {
     }
     // 表情身体倾角（哼气扭头）：平滑趋近目标，叠加在小动作之上
     this.tiltCur += (this.tiltTarget - this.tiltCur) * 0.12
-    // skin-1 拖拽甩动：拖住时跟手倾侧，松手（>120ms 无位移）弹簧回正
-    if (now - this.lastDragAt > 120) {
-      this.dragTarget *= 0.82
-      this.dragStretch *= 0.8
-    }
-    this.dragRot += (this.dragTarget - this.dragRot) * 0.3
-    this.body.rotation = this.tiltCur + this.dragRot
-
-    // skin-2 四肢弹簧摆动：待机正弦轻晃 + 拖拽反向甩（身体倾角的 ~2 倍，果冻跟随）
-    // + 说话手臂小比划；阻尼弹簧回正 → 松手/落地后自然颤两下。dt 钳 33ms 防爆。
+    this.dragPose.step(dt)
+    const drag = this.dragPose
+    this.body.rotation = this.tiltCur + drag.tilt
+    // Arms, legs and ears have different targets before the spring step.
+    const avatar = this.cfg.avatar
+    const rig = !this.skinSprite
+    const walking = this.walkStart < 0 ? 0 : (now - this.walkStart) / 1500
+    if (walking >= 1) this.walkStart = -1
+    const step = walking > 0 && walking < 1 ? Math.sin(walking * Math.PI * 8) * 0.57 : 0
     if (this.limbs.length) {
       const sdt = Math.min(dt, 0.033)
       for (const lb of this.limbs) {
         // skin-2 摆幅：±0.16~0.18 rad（≈10°）肉眼可辨；再小真机无感（用户实测反馈）
         const sway = Math.sin(t * 1.9 + lb.phase) * (lb.kind === 'arm' ? 0.16 : 0.08)
-        const flop = lb.side * -this.dragRot * (lb.kind === 'arm' ? 2.2 : 1.2)
+        const flop = drag.angle(lb.kind, lb.side, t, lb.phase)
         const talk =
           lb.kind === 'arm' && this.speaking
             ? Math.sin(t * 11 + lb.phase) * 0.28 * (0.3 + this.mouthOpen)
             : 0
-        const rest = lb.side * (lb.kind === 'arm' ? 0.18 : 0.08)
-        const target = rest + sway + flop + talk
-        lb.vel += (target - lb.angle) * 120 * sdt
-        lb.vel *= Math.exp(-8 * sdt)
-        lb.angle += lb.vel * sdt
+        const rest = rig
+          ? lb.side * (lb.kind === 'ear' ? 0.21 : lb.kind === 'tail' ? -1.08 : lb.kind === 'arm' ? -0.37 : -0.12)
+          : lb.side * (lb.kind === 'arm' ? 0.18 : 0.08)
+        const kick = rig && lb.kind === 'leg' && this.hopStart >= 0 ? 0.4 * Math.sin(t * 15 + lb.phase) : 0
+        const stride = lb.kind === 'leg' ? lb.side * step : lb.kind === 'arm' ? lb.side * -step * 0.6 : 0
+        const target = rest + sway + flop + talk + kick + stride
+        stepSpring(lb, target, avatar?.stiffness ?? DEFAULT_STIFFNESS, avatar?.damping ?? DEFAULT_DAMPING, sdt)
         lb.sp.rotation = lb.angle
       }
     }
@@ -842,13 +920,13 @@ export class SpritePetRenderer implements PetRenderer {
         yOff += Math.max(0, Math.sin(p * Math.PI * 2)) * 5
       } else {
         // sway 摇摆：身体轻轻左右晃
-        this.body.rotation = this.tiltCur + this.dragRot + Math.sin(p * Math.PI * 3) * 0.07 * (1 - p)
+        this.body.rotation = this.tiltCur + drag.tilt + Math.sin(p * Math.PI * 3) * 0.07 * (1 - p)
       }
     }
 
-    // skin-1 拖拽甩动拉伸：拖拽速度越快身体拉得越长（方向旋转已在上文）
-    sx *= 1 + this.dragStretch * 0.6
-    sy *= 1 + this.dragStretch
+    sx *= 1 - drag.lift * 0.10
+    sy *= 1 + drag.lift * 0.19 + Math.abs(drag.y) * 0.055
+    yOff -= drag.lift * 21
 
     // drag-1 落地挤压：衰减振荡（先扁后回弹两下），与拖拽拉伸共用 scale 管线
     if (this.landT >= 0) {
@@ -862,14 +940,18 @@ export class SpritePetRenderer implements PetRenderer {
       }
     }
 
+    if (rig && avatar) {
+      sx *= avatar.width
+      sy *= avatar.height
+    }
     this.body.scale.set(sx, sy)
     this.body.y = yOff
-    this.glow.alpha = mp.glowBase + 0.07 * Math.sin((t * 2 * Math.PI) / period + 1) + (this.speaking ? 0.12 : 0) + actGlow
+    this.glow.alpha = (0.11 + 0.18 * (mp.glowBase + actGlow) + 0.025 * Math.sin(t * 2 * Math.PI / period)) * (1 - drag.lift * 0.72)
 
     // §11.36 戳一戳灵气：挤压回弹的同时荡出一圈光晕涟漪
     if (this.pokeStart >= 0) {
       const pp = (now - this.pokeStart) / 420
-      if (pp < 1) this.glow.alpha += 0.32 * Math.sin(pp * Math.PI)
+      if (pp < 1) this.glow.alpha += 0.055 * Math.sin(pp * Math.PI)
     }
 
     // L1 持有提示：1.8s 内三次衰减光脉冲（docs/05 §2.5）
@@ -878,12 +960,15 @@ export class SpritePetRenderer implements PetRenderer {
       if (p >= 1) {
         this.hintStart = -1
       } else {
-        this.glow.alpha += 0.28 * Math.sin(p * Math.PI) * Math.abs(Math.sin(p * 3 * Math.PI))
+        const pulse = Math.sin(p * Math.PI) * Math.abs(Math.sin(p * 3 * Math.PI))
+        this.glow.alpha += 0.09 * pulse
+        this.body.y -= 3.8 * pulse
       }
     }
 
     // 说话：身体前倾 + 口型（§8.4：boundary 脉冲驱动真实口型；不发 boundary 的语音回退正弦）
-    this.body.x = mp.wobble ? Math.sin(t * 7) * 2.5 : 0
+    this.body.x = (mp.wobble ? Math.sin(t * 7) * 2.5 : 0) +
+      (walking > 0 && walking < 1 ? Math.sin(walking * Math.PI) * 34 : 0)
     if (this.speaking) {
       this.mouthEnergy *= Math.exp(-dt / 0.16)
       this.mouthOpen =
@@ -917,8 +1002,9 @@ export class SpritePetRenderer implements PetRenderer {
     }
     // §11.35 表情眯合：squint<1 眯眼（开心/委屈），>1 略睁大（惊讶）；actDroop=瞌睡点头垂眼
     const sq = EXPR_PARAMS[this.expr].squint
+    const sleepEyes = sleeping ? 0.65 : 1
     this.eyes.forEach((e) =>
-      e.scale.set(sq > 1 ? sq : 1, (1 - mp.eyeDroop) * (1 - actDroop) * blinkK * Math.min(sq, 1))
+      e.scale.set(sq > 1 ? sq : 1, (1 - mp.eyeDroop) * (1 - actDroop) * blinkK * Math.min(sq, 1) * sleepEyes)
     )
 
     // §11.35 表情生命周期：到时回落 normal；腮红平滑趋近目标；贴纸弹入+浮动
@@ -936,8 +1022,8 @@ export class SpritePetRenderer implements PetRenderer {
     }
 
     // 视线：瞳孔/眼眶平滑跟随
-    this.eyeOffset.x += (this.look.x * 5 - this.eyeOffset.x) * 0.12
-    this.eyeOffset.y += (this.look.y * 3.5 - this.eyeOffset.y) * 0.12
+    this.eyeOffset.x += (this.look.x * 3.2 - this.eyeOffset.x) * 0.12
+    this.eyeOffset.y += (this.look.y * 2.2 - this.eyeOffset.y) * 0.12
     for (const pupil of this.pupils) {
       pupil.x = this.eyeOffset.x
       pupil.y = this.eyeOffset.y
@@ -945,8 +1031,8 @@ export class SpritePetRenderer implements PetRenderer {
     if (this.pupils.length === 0) {
       // 非 round 眼型：整个眼眶轻微偏移
       for (const e of this.eyes) {
-        e.x = (e.x < 0 ? -17 : 17) + this.eyeOffset.x * 0.6
-        e.y = -R - 12 + this.eyeOffset.y * 0.6
+        e.x = (e.x < 0 ? -1 : 1) * EYE_GAP * (avatar?.eyes ?? 1) + this.eyeOffset.x * 0.6
+        e.y = FACE_EYE_Y + this.eyeOffset.y * 0.6
       }
     }
     this.root.rotation = this.eyeOffset.x * 0.012
@@ -983,12 +1069,16 @@ export class SpritePetRenderer implements PetRenderer {
     if (!this.app || !this.root) return
     const w = this.app.renderer.width / this.app.renderer.resolution
     const h = this.app.renderer.height / this.app.renderer.resolution
-    // 所有部件围绕 (0, -R) 绘制，本体下沿≈root 原点；视觉外沿是外层光晕
-    // （直径 ≈230 单位）。按光晕的像素预算反推缩放，否则窗口一大光晕就铺满整屏
-    const s =
-      (Math.min(w * 0.55, h * 0.95) / GLOW_D) * SIZE_FACTOR[this.cfg.size] * this.growth
+    const usableHeight = Math.max(0, h - FOOT_PADDING)
+    const avatar = this.cfg.avatar
+    const ears = (avatar?.kind === 'long-ears' ? 41 : 29) * (avatar?.ears ?? 0.69)
+    const accessoryHeight = this.cfg.accessory === 'antenna' ? 134 : this.cfg.accessory === 'halo' ? 123 : 0
+    const coatHeight = Math.max(88, 73 + ears, accessoryHeight) * (avatar?.height ?? 1)
+    const poseHeight = this.skinSprite?.height ?? coatHeight
+    const preferredScale = (w * 0.47 / FIGURE_BOX) * SIZE_FACTOR[this.cfg.size] * this.growth
+    const s = Math.min(preferredScale, usableHeight / (poseHeight + 45))
     this.root.scale.set(s)
     this.root.x = w / 2
-    this.root.y = h - 8 // 本体底部贴着区域底边
+    this.root.y = h - FOOT_PADDING
   }
 }

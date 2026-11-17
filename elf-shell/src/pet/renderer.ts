@@ -1,3 +1,5 @@
+import type { Avatar } from './avatar'
+
 /**
  * 精灵形象渲染层抽象（docs/01 §6 M1 在场层）。
  * 当前实现：程序生成光团精灵（sprite.ts）；接口预留 Live2D/VRM 可插拔替代。
@@ -20,8 +22,10 @@ export interface PetRenderer {
   speak(on: boolean): void
   /** 用户点击宠物的即时反应。 */
   poke(): void
-  /** skin-1 拖拽甩动：拖拽中每帧传入窗口位移（px），精灵据此倾侧/拉伸并弹簧回正。 */
-  dragBy?(dx: number, dy: number): void
+  /** Mouse attachment and velocity use the same joints as the avatar preview. */
+  grab?(point: number): void
+  dragVelocity?(vx: number, vy: number): void
+  releaseGrab?(vx?: number, vy?: number): void
   /** drag-1 落地挤压：投掷落地/撞边触发（impact 0.1~0.5），衰减振荡一次。 */
   land?(impact: number): void
   /** 成长缩放（docs/05 §4.1：升级光团渐进变大，1=捏脸体型；不改用户选的 size 档）。 */
@@ -55,6 +59,7 @@ export interface SpriteConfig {
   /** §11.37 用户上传的皮肤图（dataURL）：设置后整图替代程序化光团本体；
    * 壳侧 localStorage 持有，不进 brain profile（防 base64 撑爆脑库）。 */
   skin?: string
+  avatar?: Avatar
 }
 
 export const DEFAULT_SPRITE: SpriteConfig = {
